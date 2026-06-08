@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>3D Modeler - .sou Support</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #222; color: white; font-family: sans-serif; touch-action: none; }
+        canvas { display: block; }
+        #ui-container {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 10px;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 15px;
+            border-radius: 12px;
+            pointer-events: auto;
+        }
+        button, label {
+            padding: 12px 20px;
+            font-size: 16px;
+            font-weight: bold;
+            color: #fff;
+            background: #4CAF50;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            text-align: center;
+        }
+        button:active, label:active { background: #45a049; }
+        #file-input { display: none; }
+        .mode-btn { background: #2196F3; }
+        .mode-btn.active { background: #ff9800; }
+        #export-obj { background: #9c27b0; }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/exporters/OBJExporter.js"></script>
+</head>
+<body>
+
+    <div id="ui-container">
+        <button id="toggle-mode" class="mode-btn active">モード: 追加</button>
+        <button id="save-sou">.sou 保存</button>
+        <label for="file-input">.sou 読込</label>
+        <input type="file" id="file-input" accept=".sou">
+        <button id="export-obj">.obj プレビュー出力</button>
+    </div>
+
+    <script>
+        let scene, camera, renderer, controls;
+        let plane, rollOverMesh, rollOverMaterial;
+        let objects = []; // 配置したブロックの配列
+        let blocksData = []; // .sou保存用のデータ
+        let isAddMode = true;
+
+        const cubeGeo = new THREE.BoxGeometry(50, 50, 50);
+        const cubeMaterial = new THREE.MeshLambertMaterial({ color: 0x00ff00 });
+
+        const raycaster = new THREE.Raycaster();
+        const pointer = new THREE.Vector2();
+
+        init();
+        animate();
+
+        function init() {
+            // シーンのセットアップ
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0xf0f0f0);
+
+            // カメラ
+            camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 1, 10000);
+            camera.position.set(500, 800, 1300);
+            camera.lookAt(0, 0, 0);
+
+            // ロールオーバー（配置予定地の半透明ブロック）
+            const rollOverGeo = new THREE.BoxGeometry(50, 50, 50);
+            rollOverMaterial = new THREE.MeshBasicMaterial({ color: 0xff0000, opacity: 0.5, transparent: true });
+            rollOverMesh = new THREE.Mesh(rollOverGeo, rollOverMaterial);
+            scene.add(rollOverMesh);
+
+            // グリッドと基準面
+            const gridHelper = new THREE.GridHelper(1000, 20);
+            scene.add(gridHelper);
+
+            const geometry = new THREE.PlaneGeometry(1000, 1000);
+            geometry.rotateX(- Math.PI / 2);
+            plane = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ visible: false }));
+            scene.add(plane);
+            objects.push(plane);
+
+            // ライト
+            const ambientLight = new THREE.AmbientLight(0x606060);
+            scene.add(ambientLight);
+            const directionalLight = new THREE.DirectionalLight(0xffffff);
+            directionalLight.position.set(1, 0.75, 0.5).normalize();
+            scene.add(directionalLight);
+
+            // レンダラー
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            document.body.appendChild(renderer.domElement);
+
+            // iPadタッチ・マウス用のカメラコントロール
+            controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+
+            // イベントリスナー
+            renderer.domElement.addEventListener('pointermove', onPointerMove);
+            renderer.domElement.addEventListener('pointerdown', onPointerDown);
+            window.addEventListener('resize', onWindowResize);
+
+            // UIボタンのイベント
+            document.getElementById('toggle-mode').addEventListener('click', (e) => {
+                isAddMode = !isAddMode;
+                e.target.innerText = isAddMode ? "モード: 追加" : "モード: 削除";
+                e.target.classList.toggle('active', isAddMode);
+                rollOverMesh.visible = isAddMode;
+            });
+
+            document.getElementById('save-sou').addEventListener('click', saveSou);
+            document.getElementById('file-input').addEventListener('change', loadSou);
+            document.getElementById('export-obj').addEventListener('click', exportObj);
+        }
+
+        // iPadでの指の動き、マウスの動きの取得
+        function onPointerMove(event) {
+            pointer.set((event.clientX / window.innerWidth) * 2 - 1, - (event.clientY / window.innerHeight) * 2 + 1);
+            raycaster.setFromCamera(pointer, camera);
+            const intersects = raycaster.intersectObjects(objects, false);
+            
+            if (intersects.length > 0) {
+                const intersect = intersects[0];
+                rollOverMesh.position.copy(intersect.point).add(intersect.face.normal);
+                rollOverMesh.position.divideScalar(50).floor().multiplyScalar(50).addScalar(25);
+            }
+        }
+
+        // タッチ・クリック時のブロック配置・削除
+        function onPointerDown(event) {
+            if (event.isPrimary === false) return; // マルチタッチの2本目以降は無視
+            
+            pointer.set((event.clientX / window.innerWidth) * 2 - 1, - (event.clientY / window.innerHeight) * 2 + 1);
+            raycaster.setFromCamera(pointer, camera);
+            const intersects = raycaster.intersectObjects(objects, false);
+
+            if (intersects.length > 0) {
+                const intersect = intersects[0];
+
+                if (isAddMode) {
+                    // ブロック追加
+                    const voxel = new THREE.Mesh(cubeGeo, cubeMaterial);
+                    voxel.position.copy(intersect.point).add(intersect.face.normal);
+                    voxel.position.divideScalar(50).floor().multiplyScalar(50).addScalar(25);
+                    scene.add(voxel);
+                    objects.push(voxel);
+                } else {
+                    // ブロック削除 (plane以外)
+                    if (intersect.object !== plane) {
+                        scene.remove(intersect.object);
+                        objects.splice(objects.indexOf(intersect.object), 1);
+                    }
+                }
+            }
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update();
+            renderer.render(scene, camera);
+        }
+
+        // --- .sou ファイルシステム ---
+
+        // 独自の .sou 形式で保存 (中身はJSON)
+        function saveSou() {
+            const dataToSave = objects
+                .filter(obj => obj !== plane) // 基準面は保存しない
+                .map(voxel => ({
+                    x: voxel.position.x,
+                    y: voxel.position.y,
+                    z: voxel.position.z,
+                    color: voxel.material.color.getHex()
+                }));
+
+            const jsonString = JSON.stringify(dataToSave);
+            const blob = new Blob([jsonString], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'model.sou';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        }
+
+        // .sou ファイルの読み込み
+        function loadSou(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                try {
+                    const loadedData = JSON.parse(e.target.result);
+                    
+                    // 現在のブロックをすべて削除
+                    objects.forEach(obj => { if (obj !== plane) scene.remove(obj); });
+                    objects = [plane];
+
+                    // 読み込んだデータを元にブロックを再配置
+                    loadedData.forEach(data => {
+                        const mat = new THREE.MeshLambertMaterial({ color: data.color });
+                        const voxel = new THREE.Mesh(cubeGeo, mat);
+                        voxel.position.set(data.x, data.y, data.z);
+                        scene.add(voxel);
+                        objects.push(voxel);
+                    });
+                } catch (error) {
+                    alert('ファイルの読み込みに失敗しました。正しい.souファイルですか？');
+                }
+            };
+            reader.readAsText(file);
+            event.target.value = ''; // 連続で同じファイルを読めるようにリセット
+        }
+
+        // iPadファイルアプリプレビュー用の .obj 出力機能
+        function exportObj() {
+            const exporter = new THREE.OBJExporter();
+            // planeやrollOverMeshを除外するため、ブロックのみのグループを作成
+            const exportGroup = new THREE.Group();
+            objects.forEach(obj => {
+                if (obj !== plane) exportGroup.add(obj.clone());
+            });
+
+            const result = exporter.parse(exportGroup);
+            const blob = new Blob([result], { type: 'text/plain' });
+            const url = URL.createObjectURL(blob);
+            
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'model.obj';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        }
+    </script>
+</body>
+</html>
