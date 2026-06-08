@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>3D Modeler - .sou Support</title>
+    <title>3D Modeler - Advanced .sou Support</title>
     <style>
         body { margin: 0; overflow: hidden; background-color: #222; color: white; font-family: sans-serif; touch-action: none; }
         canvas { display: block; }
@@ -18,6 +18,9 @@
             padding: 15px;
             border-radius: 12px;
             pointer-events: auto;
+            align-items: center;
+            flex-wrap: wrap;
+            justify-content: center;
         }
         button, label {
             padding: 12px 20px;
@@ -34,32 +37,56 @@
         #file-input { display: none; }
         .mode-btn { background: #2196F3; }
         .mode-btn.active { background: #ff9800; }
+        .history-btn { background: #607d8b; }
+        .history-btn:active { background: #455a64; }
         #export-obj { background: #9c27b0; }
+        #export-gltf { background: #e91e63; }
+        
+        #color-picker {
+            padding: 0;
+            width: 44px;
+            height: 44px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            background: none;
+        }
+        #color-picker::-webkit-color-swatch-wrapper { padding: 0; }
+        #color-picker::-webkit-color-swatch { border: 2px solid #fff; border-radius: 8px; }
     </style>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/exporters/OBJExporter.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/exporters/GLTFExporter.js"></script>
 </head>
 <body>
 
     <div id="ui-container">
+        <input type="color" id="color-picker" value="#00ff00" title="色を選択">
         <button id="toggle-mode" class="mode-btn active">モード: 追加</button>
+        <button id="undo-btn" class="history-btn">元に戻す</button>
+        <button id="redo-btn" class="history-btn">やり直す</button>
         <button id="save-sou">.sou 保存</button>
         <label for="file-input">.sou 読込</label>
         <input type="file" id="file-input" accept=".sou">
-        <button id="export-obj">.obj プレビュー出力</button>
+        <button id="export-obj">.obj 出力</button>
+        <button id="export-gltf">.gltf 最適化出力</button>
     </div>
 
     <script>
         let scene, camera, renderer, controls;
         let plane, rollOverMesh, rollOverMaterial;
-        let objects = []; // 配置したブロックの配列
-        let blocksData = []; // .sou保存用のデータ
+        let objects = []; 
         let isAddMode = true;
+        
+        // 連続配置・履歴管理用変数
+        let isPointerDown = false;
+        let lastPlacedPosition = new THREE.Vector3();
+        let historyStack = [];
+        let redoStack = [];
 
         const cubeGeo = new THREE.BoxGeometry(50, 50, 50);
-        const cubeMaterial = new THREE.MeshLambertMaterial({ color: 0x00ff00 });
-
+        const colorPicker = document.getElementById('color-picker');
         const raycaster = new THREE.Raycaster();
         const pointer = new THREE.Vector2();
 
@@ -67,22 +94,18 @@
         animate();
 
         function init() {
-            // シーンのセットアップ
             scene = new THREE.Scene();
             scene.background = new THREE.Color(0xf0f0f0);
 
-            // カメラ
             camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 1, 10000);
             camera.position.set(500, 800, 1300);
             camera.lookAt(0, 0, 0);
 
-            // ロールオーバー（配置予定地の半透明ブロック）
             const rollOverGeo = new THREE.BoxGeometry(50, 50, 50);
-            rollOverMaterial = new THREE.MeshBasicMaterial({ color: 0xff0000, opacity: 0.5, transparent: true });
+            rollOverMaterial = new THREE.MeshBasicMaterial({ color: colorPicker.value, opacity: 0.5, transparent: true });
             rollOverMesh = new THREE.Mesh(rollOverGeo, rollOverMaterial);
             scene.add(rollOverMesh);
 
-            // グリッドと基準面
             const gridHelper = new THREE.GridHelper(1000, 20);
             scene.add(gridHelper);
 
@@ -92,43 +115,52 @@
             scene.add(plane);
             objects.push(plane);
 
-            // ライト
             const ambientLight = new THREE.AmbientLight(0x606060);
             scene.add(ambientLight);
             const directionalLight = new THREE.DirectionalLight(0xffffff);
             directionalLight.position.set(1, 0.75, 0.5).normalize();
             scene.add(directionalLight);
 
-            // レンダラー
             renderer = new THREE.WebGLRenderer({ antialias: true });
             renderer.setPixelRatio(window.devicePixelRatio);
             renderer.setSize(window.innerWidth, window.innerHeight);
             document.body.appendChild(renderer.domElement);
 
-            // iPadタッチ・マウス用のカメラコントロール
             controls = new THREE.OrbitControls(camera, renderer.domElement);
             controls.enableDamping = true;
             controls.dampingFactor = 0.05;
 
-            // イベントリスナー
+            // イベントリスナーの追加と修正
             renderer.domElement.addEventListener('pointermove', onPointerMove);
             renderer.domElement.addEventListener('pointerdown', onPointerDown);
+            renderer.domElement.addEventListener('pointerup', onPointerUp);
+            renderer.domElement.addEventListener('pointerleave', onPointerUp);
             window.addEventListener('resize', onWindowResize);
+            window.addEventListener('keydown', onKeyDown);
 
-            // UIボタンのイベント
-            document.getElementById('toggle-mode').addEventListener('click', (e) => {
-                isAddMode = !isAddMode;
-                e.target.innerText = isAddMode ? "モード: 追加" : "モード: 削除";
-                e.target.classList.toggle('active', isAddMode);
-                rollOverMesh.visible = isAddMode;
+            colorPicker.addEventListener('input', (e) => {
+                rollOverMaterial.color.set(e.target.value);
             });
 
+            // UIボタンイベント
+            document.getElementById('toggle-mode').addEventListener('click', () => setMode(!isAddMode));
+            document.getElementById('undo-btn').addEventListener('click', undo);
+            document.getElementById('redo-btn').addEventListener('click', redo);
             document.getElementById('save-sou').addEventListener('click', saveSou);
             document.getElementById('file-input').addEventListener('change', loadSou);
             document.getElementById('export-obj').addEventListener('click', exportObj);
+            document.getElementById('export-gltf').addEventListener('click', exportGltf);
         }
 
-        // iPadでの指の動き、マウスの動きの取得
+        // モード切り替え関数
+        function setMode(addMode) {
+            isAddMode = addMode;
+            const toggleBtn = document.getElementById('toggle-mode');
+            toggleBtn.innerText = isAddMode ? "モード: 追加" : "モード: 削除";
+            toggleBtn.classList.toggle('active', isAddMode);
+            rollOverMesh.visible = isAddMode;
+        }
+
         function onPointerMove(event) {
             pointer.set((event.clientX / window.innerWidth) * 2 - 1, - (event.clientY / window.innerHeight) * 2 + 1);
             raycaster.setFromCamera(pointer, camera);
@@ -136,14 +168,35 @@
             
             if (intersects.length > 0) {
                 const intersect = intersects[0];
-                rollOverMesh.position.copy(intersect.point).add(intersect.face.normal);
-                rollOverMesh.position.divideScalar(50).floor().multiplyScalar(50).addScalar(25);
+                const targetPos = new THREE.Vector3();
+                targetPos.copy(intersect.point).add(intersect.face.normal);
+                targetPos.divideScalar(50).floor().multiplyScalar(50).addScalar(25);
+                
+                rollOverMesh.position.copy(targetPos);
+
+                // 機能2: ドラッグによる連続配置モード
+                if (isPointerDown && isAddMode) {
+                    if (!targetPos.equals(lastPlacedPosition)) {
+                        // 重複配置の防止チェック
+                        const alreadyExists = objects.some(obj => obj !== plane && obj.position.equals(targetPos));
+                        if (!alreadyExists) {
+                            const voxelMaterial = new THREE.MeshLambertMaterial({ color: colorPicker.value });
+                            const voxel = new THREE.Mesh(cubeGeo, voxelMaterial);
+                            voxel.position.copy(targetPos);
+                            scene.add(voxel);
+                            objects.push(voxel);
+                            
+                            pushHistory('add', voxel);
+                            lastPlacedPosition.copy(targetPos);
+                        }
+                    }
+                }
             }
         }
 
-        // タッチ・クリック時のブロック配置・削除
         function onPointerDown(event) {
-            if (event.isPrimary === false) return; // マルチタッチの2本目以降は無視
+            if (event.isPrimary === false) return;
+            isPointerDown = true;
             
             pointer.set((event.clientX / window.innerWidth) * 2 - 1, - (event.clientY / window.innerHeight) * 2 + 1);
             raycaster.setFromCamera(pointer, camera);
@@ -153,20 +206,82 @@
                 const intersect = intersects[0];
 
                 if (isAddMode) {
-                    // ブロック追加
-                    const voxel = new THREE.Mesh(cubeGeo, cubeMaterial);
+                    const voxelMaterial = new THREE.MeshLambertMaterial({ color: colorPicker.value });
+                    const voxel = new THREE.Mesh(cubeGeo, voxelMaterial);
                     voxel.position.copy(intersect.point).add(intersect.face.normal);
                     voxel.position.divideScalar(50).floor().multiplyScalar(50).addScalar(25);
-                    scene.add(voxel);
-                    objects.push(voxel);
+                    
+                    // 重複がなければ配置
+                    const alreadyExists = objects.some(obj => obj !== plane && obj.position.equals(voxel.position));
+                    if (!alreadyExists) {
+                        scene.add(voxel);
+                        objects.push(voxel);
+                        
+                        pushHistory('add', voxel);
+                        lastPlacedPosition.copy(voxel.position);
+                    }
                 } else {
-                    // ブロック削除 (plane以外)
+                    // ブロック削除
                     if (intersect.object !== plane) {
-                        scene.remove(intersect.object);
-                        objects.splice(objects.indexOf(intersect.object), 1);
+                        const removedObj = intersect.object;
+                        scene.remove(removedObj);
+                        objects.splice(objects.indexOf(removedObj), 1);
+                        
+                        pushHistory('remove', removedObj);
                     }
                 }
             }
+        }
+
+        function onPointerUp() {
+            isPointerDown = false;
+        }
+
+        // 機能7: キーボードショートカット
+        function onKeyDown(event) {
+            switch (event.key.toLowerCase()) {
+                case 'e': setMode(true); break;
+                case 'q': setMode(false); break;
+                case 'z': undo(); break;
+                case 'y': redo(); break;
+                // WASDによる視点の平行移動
+                case 'w': controls.target.z -= 25; camera.position.z -= 25; break;
+                case 's': controls.target.z += 25; camera.position.z += 25; break;
+                case 'a': controls.target.x -= 25; camera.position.x -= 25; break;
+                case 'd': controls.target.x += 25; camera.position.x += 25; break;
+            }
+        }
+
+        // 機能7: Undo / Redo システム
+        function pushHistory(type, object) {
+            historyStack.push({ type: type, object: object });
+            redoStack = []; // 新しい操作が行われたらRedoスタックをクリア
+        }
+
+        function undo() {
+            if (historyStack.length === 0) return;
+            const action = historyStack.pop();
+            if (action.type === 'add') {
+                scene.remove(action.object);
+                objects.splice(objects.indexOf(action.object), 1);
+            } else if (action.type === 'remove') {
+                scene.add(action.object);
+                objects.push(action.object);
+            }
+            redoStack.push(action);
+        }
+
+        function redo() {
+            if (redoStack.length === 0) return;
+            const action = redoStack.pop();
+            if (action.type === 'add') {
+                scene.add(action.object);
+                objects.push(action.object);
+            } else if (action.type === 'remove') {
+                scene.remove(action.object);
+                objects.splice(objects.indexOf(action.object), 1);
+            }
+            historyStack.push(action);
         }
 
         function onWindowResize() {
@@ -181,16 +296,13 @@
             renderer.render(scene, camera);
         }
 
-        // --- .sou ファイルシステム ---
+        // --- 保存・読み込み・出力システム ---
 
-        // 独自の .sou 形式で保存 (中身はJSON)
         function saveSou() {
             const dataToSave = objects
-                .filter(obj => obj !== plane) // 基準面は保存しない
+                .filter(obj => obj !== plane)
                 .map(voxel => ({
-                    x: voxel.position.x,
-                    y: voxel.position.y,
-                    z: voxel.position.z,
+                    x: voxel.position.x, y: voxel.position.y, z: voxel.position.z,
                     color: voxel.material.color.getHex()
                 }));
 
@@ -206,7 +318,6 @@
             document.body.removeChild(a);
         }
 
-        // .sou ファイルの読み込み
         function loadSou(event) {
             const file = event.target.files[0];
             if (!file) return;
@@ -216,11 +327,11 @@
                 try {
                     const loadedData = JSON.parse(e.target.result);
                     
-                    // 現在のブロックをすべて削除
                     objects.forEach(obj => { if (obj !== plane) scene.remove(obj); });
                     objects = [plane];
+                    historyStack = [];
+                    redoStack = [];
 
-                    // 読み込んだデータを元にブロックを再配置
                     loadedData.forEach(data => {
                         const mat = new THREE.MeshLambertMaterial({ color: data.color });
                         const voxel = new THREE.Mesh(cubeGeo, mat);
@@ -229,21 +340,17 @@
                         objects.push(voxel);
                     });
                 } catch (error) {
-                    alert('ファイルの読み込みに失敗しました。正しい.souファイルですか？');
+                    alert('ファイルの読み込みに失敗しました。');
                 }
             };
             reader.readAsText(file);
-            event.target.value = ''; // 連続で同じファイルを読めるようにリセット
+            event.target.value = '';
         }
 
-        // iPadファイルアプリプレビュー用の .obj 出力機能
         function exportObj() {
             const exporter = new THREE.OBJExporter();
-            // planeやrollOverMeshを除外するため、ブロックのみのグループを作成
             const exportGroup = new THREE.Group();
-            objects.forEach(obj => {
-                if (obj !== plane) exportGroup.add(obj.clone());
-            });
+            objects.forEach(obj => { if (obj !== plane) exportGroup.add(obj.clone()); });
 
             const result = exporter.parse(exportGroup);
             const blob = new Blob([result], { type: 'text/plain' });
@@ -255,6 +362,31 @@
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);
+        }
+
+        // 機能6: 色付き・メッシュ最適化モデル(.gltf)のエクスポート
+        function exportGltf() {
+            const exporter = new THREE.GLTFExporter();
+            const exportGroup = new THREE.Group();
+            
+            objects.forEach(obj => {
+                if (obj !== plane) exportGroup.add(obj.clone());
+            });
+
+            exporter.parse(exportGroup, function (gltf) {
+                const jsonString = JSON.stringify(gltf);
+                const blob = new Blob([jsonString], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'model.gltf';
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+            }, function (error) {
+                console.error('GLTFの出力に失敗しました:', error);
+            }, { binary: false });
         }
     </script>
 </body>
